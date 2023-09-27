@@ -1,6 +1,6 @@
 _base_ = [
-    '/nvme/konglingdong/models/mmdetection3d/configs/_base_/datasets/nus-3d.py',
-    '/nvme/konglingdong/models/mmdetection3d/configs/_base_/default_runtime.py'
+    '/home/fu/workspace/mmdetection3d/configs/_base_/datasets/nus-3d.py',
+    '/home/fu/workspace/mmdetection3d/configs/_base_/default_runtime.py'
 ]
 
 plugin=True
@@ -114,7 +114,7 @@ model = dict(
             pc_range=point_cloud_range))))
 
 dataset_type = 'NuScenesDataset'
-data_root = '/nvme/share/data/sets/nuScenes/'
+data_root = '/datasets/robobev_data/mini/'
 anno_root = '../../data/'
 
 file_client_args = dict(backend='disk')

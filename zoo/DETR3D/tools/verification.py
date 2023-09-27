@@ -1,12 +1,17 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
-import mmcv
 import os
 os.chdir('/home/fu/workspace/RoboBEV/zoo/DETR3D')
 import sys
 sys.path.append("/home/fu/workspace/RoboBEV/zoo/DETR3D")
-import torch
+import copy
+import time
 import warnings
+
+import numpy as np
+import torch
+
+import mmcv
 from mmcv import Config, DictAction
 from mmcv.cnn import fuse_conv_bn
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
@@ -15,10 +20,34 @@ from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
 
 from mmdet3d.apis import single_gpu_test
 from mmdet3d.datasets import build_dataloader, build_dataset
+from projects.mmdet3d_plugin.datasets import CustomNuScenesDataset
+from projects.mmdet3d_plugin.verification import (FunctionalVerification,
+     LowBoundedDIRECT_full_parrallel)
 from mmdet3d.models import build_model
 from mmdet.apis import multi_gpu_test, set_random_seed
 from mmdet.datasets import replace_ImageToTensor
+from kornia.enhance import (adjust_brightness, adjust_gamma,
+                            adjust_hue, adjust_saturation)
+from torchvision.utils import save_image
 
+
+class OpticalVerification(FunctionalVerification):
+    @staticmethod
+    def functional_perturb(x, in_arr):
+        transformed = torch.zeros_like(x)
+        # hue, saturation, contrast, bright = \
+        #     in_arr[0], in_arr[1], in_arr[2], in_arr[3]
+        # hue, saturation, contrast = in_arr[0], in_arr[1], in_arr[2]
+        x, min_max_v = OpticalVerification._normlise_img(x)
+        hue, saturation = in_arr[0], in_arr[1]
+        with torch.no_grad():
+            x = adjust_hue(x, hue)
+            x = adjust_saturation(x, saturation)
+            # x = adjust_gamma(x, contrast)
+            # x = adjust_brightness(x, bright)
+        x = OpticalVerification._unnormlise_img(x, *min_max_v)
+        transformed = x
+        return transformed 
 
 def get_args(arg_lst):
     parser = argparse.ArgumentParser(
@@ -82,6 +111,28 @@ def get_args(arg_lst):
         action=DictAction,
         help='custom options for evaluation, the key-value pair in xxx=yyy '
         'format will be kwargs for dataset.evaluate() function')
+
+    # perturbation
+    parser.add_argument('--hue', default=0.1, type=float,
+        help='range should be in [-PI, PI], while 0 means no shift'
+        'control: [ - defautl * PI, defautl * PI]')
+    parser.add_argument('--saturation', default=0.2, type=float,
+        help='range should be in [0, 2], while 1 means no shift'
+        'control: [ 1 - defautl, 1 + defautl]')
+    parser.add_argument('--contrast', default=0.0, type=float,
+        help='range should be in [0, 2], while 1 means no shift'
+        'control: [ 1 - defautl, 1 + defautl]')
+    parser.add_argument('--bright', default=0.0, type=float,
+        help='range should be in [0, 1], while 0 means no shift'
+        'control: TBD')
+    # DIRECT
+    parser.add_argument('--max-evaluation', default=500, type=int)
+    parser.add_argument('--max-deep', default=10, type=int)
+    parser.add_argument('--po-set', action='store_true')
+    parser.add_argument('--po-set-size', default=1, type=int)
+    parser.add_argument('--max-iteration', default=50, type=int)
+    parser.add_argument('--tolerance', default=1e-5, type=float)
+
     parser.add_argument(
         '--launcher',
         choices=['none', 'pytorch', 'slurm', 'mpi'],
@@ -102,6 +153,10 @@ def get_args(arg_lst):
     return args
 
 
+simplied_class_names = ['car', 'truck', 'bus', 
+                        'pedestrian', 'motorcycle', 
+                        'bicycle', 'traffic_cone']
+
 def main():
     # args = parse_args()
     arg_lst = [
@@ -110,7 +165,6 @@ def main():
         '--eval', 'bbox',
     ]
     args = get_args(arg_lst)
-
     assert args.out or args.eval or args.format_only or args.show \
         or args.show_dir, \
         ('Please specify at least one operation (save/eval/format/show the '
@@ -190,8 +244,11 @@ def main():
         set_random_seed(args.seed, deterministic=args.deterministic)
 
     # build the dataloader
-    dataset = build_dataset(cfg.data.test)
-    # a = dataset[0]
+    # dataset = build_dataset(cfg.data.test)
+    data_arg = cfg.data.test.copy()
+    data_arg.pop('type')
+    dataset = CustomNuScenesDataset(**data_arg)
+    # print(dataset.eval_detection_configs)
     data_loader = build_dataloader(
         dataset,
         samples_per_gpu=samples_per_gpu,
@@ -221,35 +278,84 @@ def main():
         # segmentation dataset has `PALETTE` attribute
         model.PALETTE = dataset.PALETTE
 
-    if not distributed:
-        model = MMDataParallel(model, device_ids=[0])
-        outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
-    else:
-        model = MMDistributedDataParallel(
-            model.cuda(),
-            device_ids=[torch.cuda.current_device()],
-            broadcast_buffers=False)
-        outputs = multi_gpu_test(model, data_loader, args.tmpdir,
-                                 args.gpu_collect)
+###################################################
+#               VERIFICATION
+###################################################
+    bound = []
+    if args.hue != 0:
+        bound.append([-np.pi*args.hue, np.pi*args.hue])
+    if args.saturation != 0:
+        bound.append([1-args.saturation, 1+args.saturation])
+    if args.contrast != 0:
+        bound.append([1-args.contrast, 1+args.contrast])
+    assert len(bound) != 0
+    bound = bound*6
+    print(bound)
 
-    rank, _ = get_dist_info()
-    if rank == 0:
-        if args.out:
-            print(f'\nwriting results to {args.out}')
-            mmcv.dump(outputs, args.out)
-        kwargs = {} if args.eval_options is None else args.eval_options
-        if args.format_only:
-            dataset.format_results(outputs, **kwargs)
-        if args.eval:
-            eval_kwargs = cfg.get('evaluation', {}).copy()
-            # hard-code way to remove EvalHook args
-            for key in [
-                    'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
-                    'rule'
-            ]:
-                eval_kwargs.pop(key, None)
-            eval_kwargs.update(dict(metric=args.eval, **kwargs))
-            print(dataset.evaluate(outputs, **eval_kwargs))
+    kwargs = {} if args.eval_options is None else args.eval_options
+    eval_kwargs = cfg.get('evaluation', {}).copy()
+    # hard-code way to remove EvalHook args
+    for key in [
+            'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
+            'rule'
+    ]:
+        eval_kwargs.pop(key, None)
+    eval_kwargs.update(dict(metric=args.eval, **kwargs))
+    # print(eval_kwargs)
+
+    # gt_boxes = get_gt_boxes(dataset)
+    model = MMDataParallel(model, device_ids=[0])
+    model.eval()
+
+    query_model = copy.deepcopy(model)
+
+    for i, data in enumerate(data_loader):
+        # print(data['img'][0].data[0].max())
+        # print(data['img'][0].data[0].min())
+        token = dataset.data_infos[i]['token']
+        task = OpticalVerification(query_model,
+                            # copy.deepcopy(model.module),
+                            token,
+                            data,
+                            simplied_class_names,
+                            dataset.results2dist)
+        object_func = task.set_problem()
+        direct_solver = LowBoundedDIRECT_full_parrallel(object_func,len(bound),
+                                                bound, 
+                                                args.max_iteration, 
+                                                args.max_deep, 
+                                                args.max_evaluation, 
+                                                args.tolerance,
+                                                debug=False)
+        start_time = time.time()
+        direct_solver.solve()
+        end_time = time.time()
+        print(f"{i+1}-th frame, time: {(end_time-start_time)/60:.2f} min")
+
+        print(list(direct_solver.optimal_result()))
+        # optimal = np.reshape(np.array([0.0, 1.1333333333333333, 0.0, 1.1333333333333333, -0.20943951023931953, 1.1333333333333333, -0.2792526803190927, 1.0, -0.20943951023931953, 1.0, -0.20943951023931953, 1.0]), (-1,2))
+        # print(optimal)
+        optimal = np.reshape(direct_solver.optimal_result(), (-1,2))
+        ori_img = OpticalVerification.get_img_tensor(data)
+        tmp_img = torch.zeros_like(ori_img)
+        for i in range(ori_img.shape[0]):
+            # save_image(OpticalVerification._normlise_img(ori_img[i])[0], f'./ori_img_{i}.png')
+            tmp_img[i] = OpticalVerification.functional_perturb(ori_img[i],optimal[i])
+            # save_image(OpticalVerification._normlise_img(tmp_img[i])[0], f'./tmp_img_{i}.png')
+
+        tmp_data = OpticalVerification.replace_img_tensor(copy.deepcopy(data), tmp_img.unsqueeze(0))
+
+        with torch.no_grad():
+            result = model(return_loss=False, rescale=True, **tmp_data)
+        dist = dataset.results2dist(result, token, simplied_class_names)
+        print(f"distance: {dist}")
+
+        with torch.no_grad():
+            result = model(return_loss=False, rescale=True, **data)
+        dist = dataset.results2dist(result, token, simplied_class_names)
+        print(f"distance: {dist}")
+
+        break
 
 
 if __name__ == '__main__':
